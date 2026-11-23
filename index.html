@@ -177,7 +177,12 @@
   let translating = false;
 
   function currentCues() {
-    return (translateOn && translatedCues) ? translatedCues : savedCues;
+    if (!savedCues) return null;
+    if (translateOn && translatedCues) {
+      // 翻訳できた分は日本語、まだの分は原文で表示する（部分適用）
+      return savedCues.map((c, i) => translatedCues[i] || c);
+    }
+    return savedCues;
   }
 
   // 字幕はブラウザ標準の字幕トラックで表示する（全画面でも表示される）
@@ -211,27 +216,30 @@
     if (translateOn && savedCues.length) translateAll();
   }
 
-  // ChromeのTranslator API（端末内翻訳）で英語字幕を日本語にする
+  // ChromeのTranslator API（端末内翻訳）で英語字幕を日本語にする。
+  // 全件終わるまで待たず、50件ごとに翻訳できた分から表示へ反映する
   async function translateAll() {
     if (translating || !translator || !savedCues) return;
     translating = true;
+    const myCues = savedCues; // 途中で別の字幕に差し替わったら、この翻訳は打ち切る
     const out = [];
-    for (let i = 0; i < savedCues.length; i++) {
-      const c = savedCues[i];
+    for (let i = 0; i < myCues.length; i++) {
+      if (!translateOn || savedCues !== myCues) { translating = false; return; }
+      const c = myCues[i];
       try {
         const t = await translator.translate(c.text.replace(/\n/g, ' '));
         out.push({ start: c.start, end: c.end, text: t });
       } catch {
         out.push(c);
       }
-      if ((i + 1) % 50 === 0) showToast(`翻訳中 ${i + 1} / ${savedCues.length} 件`, true);
+      if ((i + 1) % 50 === 0 || i === myCues.length - 1) {
+        translatedCues = out.slice();
+        if (trackEl) { trackEl.remove(); trackEl = null; }
+        applyTrack();
+        if (i < myCues.length - 1) showToast(`翻訳中 ${i + 1} / ${myCues.length} 件`, true);
+      }
     }
-    translatedCues = out;
     translating = false;
-    if (translateOn) {
-      if (trackEl) { trackEl.remove(); trackEl = null; }
-      applyTrack();
-    }
     showToast('字幕の翻訳が完了しました');
   }
 
