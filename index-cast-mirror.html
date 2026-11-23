@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>動画プレイヤー（完成版）</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+  video {
+    position: fixed; inset: 0;
+    width: 100%; height: 100dvh;
+    object-fit: contain;
+    background: #000;
+    touch-action: manipulation; /* ダブルタップ時のズームを防ぐ */
+  }
+  video::cue {
+    color: #fff;
+    background: rgba(0,0,0,.8);
+    font-family: sans-serif;
+  }
+  #hint {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: rgba(255,255,255,.75);
+    font-family: sans-serif; font-size: 18px;
+    pointer-events: none;
+  }
+  #hint.hidden { display: none; }
+  /* 右下の「選択」ボタン（標準コントロールバーのすぐ上） */
+  #menuBtn {
+    position: fixed; right: 10px; bottom: 58px;
+    padding: 8px 18px;
+    border-radius: 999px;
+    border: 1px solid rgba(255,255,255,.4);
+    background: rgba(0,0,0,.55);
+    color: #fff; font-family: sans-serif; font-size: 15px; line-height: 1;
+    cursor: pointer;
+    z-index: 30;
+  }
+  #menu {
+    position: fixed; right: 10px; bottom: 106px;
+    background: rgba(20,20,20,.95);
+    border: 1px solid rgba(255,255,255,.25);
+    border-radius: 8px;
+    overflow: hidden;
+    display: none;
+    z-index: 30;
+  }
+  #menu.open { display: block; }
+  #menu button {
+    display: block; width: 100%;
+    padding: 12px 20px;
+    background: none; border: none;
+    color: #fff; font-family: sans-serif; font-size: 15px;
+    text-align: left; cursor: pointer;
+    white-space: nowrap;
+  }
+  #menu button:active { background: rgba(255,255,255,.15); }
+  #toast {
+    position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+    color: #fff; background: rgba(0,0,0,.7);
+    font-family: sans-serif; font-size: 13px;
+    padding: 6px 12px; border-radius: 6px;
+    display: none;
+    z-index: 30;
+    white-space: nowrap;
+  }
+  input[type="file"] { display: none; }
+</style>
+</head>
+<body>
+<video id="video" controls playsinline disableremoteplayback></video>
+<div id="hint">右下の「選択」から動画を選ぶ</div>
+<button id="menuBtn" type="button">選択</button>
+<div id="menu">
+  <button id="videoSelect" type="button">動画</button>
+  <button id="srtSelect" type="button">字幕</button>
+  <button id="translateToggle" type="button">翻訳：OFF</button>
+</div>
+<div id="toast"></div>
+<input type="file" id="videoInput" accept="video/*">
+<input type="file" id="srtInput" accept=".srt">
+
+<script>
+  const video = document.getElementById('video');
+  const hint = document.getElementById('hint');
+  const toast = document.getElementById('toast');
+  const menuBtn = document.getElementById('menuBtn');
+  const menu = document.getElementById('menu');
+  const videoInput = document.getElementById('videoInput');
+  const srtInput = document.getElementById('srtInput');
+  // タブキャスト（画面ミラーリング）を維持するための設定：
+  // 動画だけをテレビへ渡す「リモート再生」を無効化し、
+  // 字幕や画面がそのままタブの映像として映るようにする
+  video.disableRemotePlayback = true;
+  let videoUrl = null;
+  let trackUrl = null;
+  let trackEl = null;
+  let toastTimer = null;
+
+  function showToast(msg, sticky = false) {
+    toast.textContent = msg;
+    toast.style.display = 'block';
+    clearTimeout(toastTimer);
+    if (!sticky) toastTimer = setTimeout(() => toast.style.display = 'none', 2500);
+  }
+
+  function loadVideo(file) {
+    if (!file) return;
+    if (videoUrl) URL.revokeObjectURL(videoUrl);
+    videoUrl = URL.createObjectURL(file);
+    video.src = videoUrl;
+    // 字幕トラックは付け直すので一度外し、読み込み済みなら再適用する
+    if (trackEl) { const t = trackEl; trackEl = null; t.remove(); applyTrack(); }
+    hint.classList.add('hidden');
+    video.play().catch(() => {});
+  }
+
+  // SRTはUTF-8が基本。読めなければShift_JISとして読み直す（古い日本語SRT対策）
+  async function readSRTText(file) {
+    const buf = await file.arrayBuffer();
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+    } catch {
+      return new TextDecoder('shift_jis').decode(buf);
+    }
+  }
+
+  function parseSRT(srt) {
+    const list = [];
+    const blocks = srt.replace(/\r\n/g, '\n').trim().split(/\n\s*\n+/);
+    blocks.forEach(block => {
+      const lines = block.trim().split('\n').map(l => l.trim()).filter(Boolean);
+      if (lines.length < 2) return;
+      const idx = /^\d+$/.test(lines[0]) ? 1 : 0;
+      const timeLine = lines[idx];
+      if (!timeLine || !timeLine.includes('-->')) return;
+      const [startStr, endStr] = timeLine.split('-->').map(t => t.trim());
+      const start = timeToSeconds(startStr);
+      const end = timeToSeconds(endStr);
+      const text = lines.slice(idx + 1).join('\n').replace(/<[^>]+>/g, '');
+      if (text) list.push({ start, end, text });
+    });
+    return list;
+  }
+
+  function timeToSeconds(t) {
+    const p = t.replace(',', '.').split(':');
+    return p.length === 3
+      ? parseFloat(p[0]) * 3600 + parseFloat(p[1]) * 60 + parseFloat(p[2])
+      : parseFloat(p[0]) * 60 + parseFloat(p[1]);
+  }
+
+  function formatVTTTime(sec) {
+    const h = String(Math.floor(sec / 3600)).padStart(2, '0');
+    const m = String(Math.floor(sec % 3600 / 60)).padStart(2, '0');
+    const s = (sec % 60).toFixed(3).padStart(6, '0');
+    return `${h}:${m}:${s}`;
+  }
+
+  let savedCues = null;
+  let translatedCues = null;
+  let translateOn = false;
+  let translator = null;
+  let translating = false;
+
+  function currentCues() {
+    return (translateOn && translatedCues) ? translatedCues : savedCues;
+  }
+
+  // 字幕はブラウザ標準の字幕トラックで表示する（全画面でも表示される）
+  function applyTrack() {
+    const cuesToUse = currentCues();
+    if (!cuesToUse) return;
+    if (trackUrl) URL.revokeObjectURL(trackUrl);
+    const vtt = 'WEBVTT\n\n' + cuesToUse.map(c =>
+      `${formatVTTTime(c.start)} --> ${formatVTTTime(c.end)}\n${c.text}`
+    ).join('\n\n') + '\n';
+    trackUrl = URL.createObjectURL(new Blob([vtt], { type: 'text/vtt' }));
+    trackEl = document.createElement('track');
+    trackEl.kind = 'captions';
+    trackEl.label = '字幕';
+    // 言語は固定しない（原文が英語でも日本語と誤表示しないため、srclangは付けない）
+    trackEl.src = trackUrl;
+    trackEl.default = true;
+    video.appendChild(trackEl);
+    trackEl.addEventListener('load', () => { trackEl.track.mode = 'showing'; });
+    if (trackEl.track) trackEl.track.mode = 'showing';
+  }
+
+  async function loadSRT(file) {
+    if (!file) return;
+    const text = await readSRTText(file);
+    savedCues = parseSRT(text);
+    translatedCues = null;
+    if (trackEl) { trackEl.remove(); trackEl = null; }
+    applyTrack();
+    showToast(savedCues.length ? `字幕 ${savedCues.length} 件を読み込みました` : '字幕を読み取れませんでした');
+    if (translateOn && savedCues.length) translateAll();
+  }
+
+  // ChromeのTranslator API（端末内翻訳）で英語字幕を日本語にする
+  async function translateAll() {
+    if (translating || !translator || !savedCues) return;
+    translating = true;
+    const out = [];
+    for (let i = 0; i < savedCues.length; i++) {
+      const c = savedCues[i];
+      try {
+        const t = await translator.translate(c.text.replace(/\n/g, ' '));
+        out.push({ start: c.start, end: c.end, text: t });
+      } catch {
+        out.push(c);
+      }
+      if ((i + 1) % 50 === 0) showToast(`翻訳中 ${i + 1} / ${savedCues.length} 件`, true);
+    }
+    translatedCues = out;
+    translating = false;
+    if (translateOn) {
+      if (trackEl) { trackEl.remove(); trackEl = null; }
+      applyTrack();
+    }
+    showToast('字幕の翻訳が完了しました');
+  }
+
+  const translateToggle = document.getElementById('translateToggle');
+  function updateTranslateLabel() {
+    translateToggle.textContent = translateOn ? '翻訳：ON' : '翻訳：OFF';
+  }
+
+  translateToggle.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    menu.classList.remove('open');
+    if (translateOn) {
+      translateOn = false;
+      updateTranslateLabel();
+      if (trackEl) { trackEl.remove(); trackEl = null; }
+      applyTrack();
+      showToast('翻訳をオフにしました（原文字幕に戻ります）');
+      return;
+    }
+    if (!('Translator' in self)) {
+      showToast('このブラウザでは翻訳機能（Translator API）が使えません');
+      return;
+    }
+    let availability;
+    try {
+      availability = await Promise.race([
+        Translator.availability({ sourceLanguage: 'en', targetLanguage: 'ja' }),
+        new Promise(r => setTimeout(() => r('timeout'), 15000))
+      ]);
+    } catch {
+      availability = 'unavailable';
+    }
+    if (availability === 'unavailable') {
+      showToast('この端末では英語→日本語の翻訳が使えません');
+      return;
+    }
+    if (availability === 'timeout') {
+      showToast('翻訳機能が応答しませんでした');
+      return;
+    }
+    showToast('翻訳の準備中です（初回は言語パックをダウンロードします）', true);
+    try {
+      translator = await Translator.create({
+        sourceLanguage: 'en', targetLanguage: 'ja',
+        monitor(m) {
+          m.addEventListener('downloadprogress', (ev) => {
+            showToast(`翻訳パックをダウンロード中 ${Math.round(ev.loaded * 100)}%`, true);
+          });
+        }
+      });
+    } catch {
+      showToast('翻訳を開始できませんでした');
+      return;
+    }
+    translateOn = true;
+    updateTranslateLabel();
+    if (savedCues && savedCues.length) {
+      translateAll();
+    } else {
+      showToast('翻訳がオンになりました。字幕を選ぶと翻訳されます');
+    }
+  });
+
+  // 画面ダブルタップで最大化／元のサイズに戻る（全画面の切り替え）。
+  // 1回のタップでは何もしない（メニュー閉じや再生操作と競合させないため）。
+  // 下部の標準コントロールバーの範囲は除外する（シークや音量操作の邪魔をしないため）
+  function toggleFullscreen() {
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    } else if (document.documentElement.requestFullscreen) {
+      document.documentElement.requestFullscreen().catch(() => {});
+    } else if (video.webkitEnterFullscreen) {
+      video.webkitEnterFullscreen(); // iPhone Safari用
+    }
+  }
+
+  let lastTapTime = 0;
+  document.addEventListener('click', (e) => {
+    if (e.target.closest && (e.target.closest('#menuBtn') || e.target.closest('#menu'))) return;
+    const wasOpen = menu.classList.contains('open');
+    menu.classList.remove('open');
+    if (wasOpen) { lastTapTime = 0; return; } // メニューを閉じたタップは数えない
+    if (!video.src) return; // 動画が選ばれるまでは何もしない
+    if (e.clientY > window.innerHeight - 70) return;
+    const now = Date.now();
+    if (now - lastTapTime <= 300) {
+      lastTapTime = 0;
+      toggleFullscreen();
+    } else {
+      lastTapTime = now;
+    }
+  });
+
+  menuBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    menu.classList.toggle('open');
+  });
+
+  document.getElementById('videoSelect').addEventListener('click', (e) => {
+    e.stopPropagation();
+    menu.classList.remove('open');
+    videoInput.click();
+  });
+
+  document.getElementById('srtSelect').addEventListener('click', (e) => {
+    e.stopPropagation();
+    menu.classList.remove('open');
+    srtInput.click();
+  });
+
+  videoInput.addEventListener('change', () => {
+    loadVideo(videoInput.files[0]);
+    videoInput.value = '';
+  });
+  srtInput.addEventListener('change', () => {
+    loadSRT(srtInput.files[0]);
+    srtInput.value = '';
+  });
+
+  // ドラッグ＆ドロップ（拡張子で動画／SRTを振り分け）
+  document.addEventListener('dragover', e => e.preventDefault());
+  document.addEventListener('drop', e => {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    if (!file) return;
+    if (/\.srt$/i.test(file.name)) loadSRT(file);
+    else loadVideo(file);
+  });
+</script>
+</body>
+</html>
