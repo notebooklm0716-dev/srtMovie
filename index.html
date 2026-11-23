@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>動画プレイヤー（完成版）</title>
+<title>動画プレイヤー</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
@@ -27,19 +27,19 @@
     pointer-events: none;
   }
   #hint.hidden { display: none; }
-  /* 右下の「選択」ボタン（標準コントロールバーのすぐ上） */
+  /* 左上の「選択」ボタン（背景は透過。明るい映像でも読めるよう文字に影だけ付ける） */
   #menuBtn {
-    position: fixed; right: 10px; bottom: 58px;
+    position: fixed; left: 10px; top: 10px;
     padding: 8px 18px;
-    border-radius: 999px;
-    border: 1px solid rgba(255,255,255,.4);
-    background: rgba(0,0,0,.55);
+    border: none;
+    background: transparent;
     color: #fff; font-family: sans-serif; font-size: 15px; line-height: 1;
+    text-shadow: 0 1px 4px rgba(0,0,0,.9), 0 0 2px rgba(0,0,0,.9);
     cursor: pointer;
     z-index: 30;
   }
   #menu {
-    position: fixed; right: 10px; bottom: 106px;
+    position: fixed; left: 10px; top: 52px;
     background: rgba(20,20,20,.95);
     border: 1px solid rgba(255,255,255,.25);
     border-radius: 8px;
@@ -71,7 +71,7 @@
 </head>
 <body>
 <video id="video" controls playsinline disableremoteplayback></video>
-<div id="hint">右下の「選択」から動画を選ぶ</div>
+<div id="hint">左上の「選択」から動画を選ぶ</div>
 <button id="menuBtn" type="button">選択</button>
 <div id="menu">
   <button id="videoSelect" type="button">動画</button>
@@ -407,6 +407,21 @@
     loadSRT(srtInput.files[0]);
     srtInput.value = '';
   });
+
+  // 「プログラムから開く」で起動された場合、OSから渡されたファイルを読み込む
+  // （manifest.json の file_handlers に登録した動画ファイルが対象）
+  if ('launchQueue' in window) {
+    window.launchQueue.setConsumer(async (launchParams) => {
+      if (!launchParams.files || launchParams.files.length === 0) return;
+      try {
+        const file = await launchParams.files[0].getFile();
+        if (/\.srt$/i.test(file.name)) loadSRT(file);
+        else loadVideo(file);
+      } catch (err) {
+        console.error('起動時に渡されたファイルを読み込めませんでした', err);
+      }
+    });
+  }
 
   // ドラッグ＆ドロップ（拡張子で動画／SRTを振り分け）
   document.addEventListener('dragover', e => e.preventDefault());
