@@ -201,8 +201,16 @@
     trackEl.src = trackUrl;
     trackEl.default = true;
     video.appendChild(trackEl);
-    trackEl.addEventListener('load', () => { trackEl.track.mode = 'showing'; });
+    trackEl.addEventListener('load', () => { trackEl.track.mode = 'showing'; nudgeSubtitleRepaint(); });
     if (trackEl.track) trackEl.track.mode = 'showing';
+  }
+
+  // 停止中に字幕トラックを差し替えると、表示中の字幕が画面に残ったままになる
+  // （翻訳OFFが効いていないように見える）ため、同じ位置へシークし直して再描画を促す
+  function nudgeSubtitleRepaint() {
+    if (!video.paused) return;
+    if (video.readyState === 0 || !isFinite(video.duration)) return;
+    try { video.currentTime = video.currentTime; } catch {}
   }
 
   async function loadSRT(file) {
@@ -216,27 +224,73 @@
     if (translateOn && savedCues.length) translateAll();
   }
 
+  // 字幕は1文が複数の字幕に分かれていることが多いので、文の終わりまでを
+  // ひとかたまりとして集める（文脈を持たせて翻訳すると訳が自然になる）
+  function groupCuesIntoSentences(cues) {
+    const groups = [];
+    let cur = [];
+    for (const c of cues) {
+      cur.push(c);
+      const text = c.text.replace(/\n/g, ' ').trim();
+      if (/[.!?…]["'”’)\]]*$/.test(text) || cur.length >= 6) { groups.push(cur); cur = []; }
+    }
+    if (cur.length) groups.push(cur);
+    return groups;
+  }
+
+  // 文全体の訳文を、元の字幕の文字数比で各字幕へ割り振り直す
+  function distributeTranslation(translated, group) {
+    if (group.length === 1) return [translated];
+    const weights = group.map(c => Math.max(1, c.text.replace(/\n/g, ' ').length));
+    const total = weights.reduce((a, b) => a + b, 0);
+    const parts = [];
+    let pos = 0;
+    let acc = 0;
+    for (let i = 0; i < group.length; i++) {
+      if (i === group.length - 1) { parts.push(translated.slice(pos).trim()); break; }
+      acc += weights[i];
+      let cut = Math.round(translated.length * acc / total);
+      // 切り位置は近くの句読点・空白の直後を優先する
+      for (let d = 0; d <= 6; d++) {
+        if (cut + d < translated.length && /[、。！？\s]/.test(translated[cut + d])) { cut = cut + d + 1; break; }
+        if (cut - d > pos && /[、。！？\s]/.test(translated[cut - d])) { cut = cut - d + 1; break; }
+      }
+      cut = Math.min(Math.max(cut, pos), translated.length);
+      parts.push(translated.slice(pos, cut).trim());
+      pos = cut;
+    }
+    return parts;
+  }
+
   // ChromeのTranslator API（端末内翻訳）で英語字幕を日本語にする。
-  // 全件終わるまで待たず、50件ごとに翻訳できた分から表示へ反映する
+  // 文単位で翻訳し、全件終わるまで待たず、50件ごとに翻訳できた分から表示へ反映する
   async function translateAll() {
     if (translating || !translator || !savedCues) return;
     translating = true;
     const myCues = savedCues; // 途中で別の字幕に差し替わったら、この翻訳は打ち切る
-    const out = [];
-    for (let i = 0; i < myCues.length; i++) {
+    const out = new Array(myCues.length);
+    let idx = 0;
+    let lastApplied = 0;
+    for (const group of groupCuesIntoSentences(myCues)) {
       if (!translateOn || savedCues !== myCues) { translating = false; return; }
-      const c = myCues[i];
+      const joined = group.map(c => c.text.replace(/\n/g, ' ')).join(' ');
+      let parts = null;
       try {
-        const t = await translator.translate(c.text.replace(/\n/g, ' '));
-        out.push({ start: c.start, end: c.end, text: t });
+        parts = distributeTranslation(await translator.translate(joined), group);
       } catch {
-        out.push(c);
+        parts = null; // 訳せなかった文は原文のままにする
       }
-      if ((i + 1) % 50 === 0 || i === myCues.length - 1) {
-        translatedCues = out.slice();
+      for (let j = 0; j < group.length; j++) {
+        const c = group[j];
+        out[idx] = parts && parts[j] ? { start: c.start, end: c.end, text: parts[j] } : c;
+        idx++;
+      }
+      if (idx - lastApplied >= 50 || idx === myCues.length) {
+        translatedCues = out.slice(0, idx);
         if (trackEl) { trackEl.remove(); trackEl = null; }
         applyTrack();
-        if (i < myCues.length - 1) showToast(`翻訳中 ${i + 1} / ${myCues.length} 件`, true);
+        lastApplied = idx;
+        if (idx < myCues.length) showToast(`翻訳中 ${idx} / ${myCues.length} 件`, true);
       }
     }
     translating = false;
