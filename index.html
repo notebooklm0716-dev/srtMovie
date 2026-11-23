@@ -249,33 +249,44 @@
   }
 
   // ChromeのTranslator API（端末内翻訳）で英語字幕を日本語にする。
-  // 文単位で翻訳し、全件終わるまで待たず、50件ごとに翻訳できた分から表示へ反映する
+  // 文単位で翻訳し、全件終わるまで待たず、50件ごとに翻訳できた分から表示へ反映する。
+  // 訳す順番は再生位置から先にし、見ている場面がすぐ日本語になるようにする
   async function translateAll() {
     if (translating || !translator || !savedCues) return;
     translating = true;
     const myCues = savedCues; // 途中で別の字幕に差し替わったら、この翻訳は打ち切る
+    const indexOf = new Map(myCues.map((c, i) => [c, i]));
     const out = new Array(myCues.length);
-    let idx = 0;
+    let done = 0;
     let lastApplied = 0;
-    for (const group of groupCuesIntoSentences(myCues)) {
+    const groups = groupCuesIntoSentences(myCues);
+    const now = video.currentTime || 0;
+    let startAt = groups.findIndex(g => g[g.length - 1].end > now);
+    if (startAt < 0) startAt = 0;
+    const ordered = groups.slice(startAt).concat(groups.slice(0, startAt));
+    for (const group of ordered) {
       if (!translateOn || savedCues !== myCues) { translating = false; return; }
       const joined = group.map(c => c.text.replace(/\n/g, ' ')).join(' ');
       let parts = null;
       try {
-        parts = distributeTranslation(await translator.translate(joined), group);
+        // 1文で応答が止まっても全体が止まらないよう、20秒で見切る
+        parts = distributeTranslation(await Promise.race([
+          translator.translate(joined),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 20000))
+        ]), group);
       } catch {
         parts = null; // 訳せなかった文は原文のままにする
       }
       for (let j = 0; j < group.length; j++) {
         const c = group[j];
-        out[idx] = parts && parts[j] ? { start: c.start, end: c.end, text: parts[j] } : c;
-        idx++;
+        out[indexOf.get(c)] = parts && parts[j] ? { start: c.start, end: c.end, text: parts[j] } : c;
+        done++;
       }
-      if (idx - lastApplied >= 50 || idx === myCues.length) {
-        translatedCues = out.slice(0, idx);
+      if (done - lastApplied >= 50 || done === myCues.length) {
+        translatedCues = out.slice();
         applyTrack();
-        lastApplied = idx;
-        if (idx < myCues.length) showToast(`翻訳中 ${idx} / ${myCues.length} 件`, true);
+        lastApplied = done;
+        if (done < myCues.length) showToast(`翻訳中 ${done} / ${myCues.length} 件`, true);
       }
     }
     translating = false;
