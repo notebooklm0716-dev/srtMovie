@@ -68,17 +68,6 @@
   }
   input[type="file"] { display: none; }
 </style>
-
-    <!-- PWA設定 -->
-    <link rel="manifest" href="./manifest.json">
-    <link rel="apple-touch-icon" href="./apple-touch-icon.png">
-    <link rel="icon" type="image/svg+xml" href="./icon.svg">
-    <link rel="icon" href="./favicon.ico" sizes="any">
-    <meta name="theme-color" content="#ffffff">
-    <meta name="mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="default">
-    <meta name="apple-mobile-web-app-title" content="動プレ">
 </head>
 <body>
 <video id="video" controls playsinline disableremoteplayback></video>
@@ -93,6 +82,16 @@
 <input type="file" id="videoInput" accept="video/*">
 <input type="file" id="srtInput" accept=".srt">
 
+    <!-- PWA設定 -->
+    <link rel="manifest" href="./manifest.json">
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png">
+    <link rel="icon" type="image/svg+xml" href="./icon.svg">
+    <link rel="icon" href="./favicon.ico" sizes="any">
+    <meta name="theme-color" content="#ffffff">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="動プレ">
 <script>
   const video = document.getElementById('video');
   const hint = document.getElementById('hint');
@@ -106,8 +105,7 @@
   // 字幕や画面がそのままタブの映像として映るようにする
   video.disableRemotePlayback = true;
   let videoUrl = null;
-  let trackUrl = null;
-  let trackEl = null;
+  let subTrack = null;
   let toastTimer = null;
 
   function showToast(msg, sticky = false) {
@@ -122,8 +120,8 @@
     if (videoUrl) URL.revokeObjectURL(videoUrl);
     videoUrl = URL.createObjectURL(file);
     video.src = videoUrl;
-    // 字幕トラックは付け直すので一度外し、読み込み済みなら再適用する
-    if (trackEl) { const t = trackEl; trackEl = null; t.remove(); applyTrack(); }
+    // 字幕トラックは動画を変えても保持されるので、読み込み済みの字幕を再適用する
+    applyTrack();
     hint.classList.add('hidden');
     video.play().catch(() => {});
   }
@@ -163,13 +161,6 @@
       : parseFloat(p[0]) * 60 + parseFloat(p[1]);
   }
 
-  function formatVTTTime(sec) {
-    const h = String(Math.floor(sec / 3600)).padStart(2, '0');
-    const m = String(Math.floor(sec % 3600 / 60)).padStart(2, '0');
-    const s = (sec % 60).toFixed(3).padStart(6, '0');
-    return `${h}:${m}:${s}`;
-  }
-
   let savedCues = null;
   let translatedCues = null;
   let translateOn = false;
@@ -185,32 +176,28 @@
     return savedCues;
   }
 
-  // 字幕はブラウザ標準の字幕トラックで表示する（全画面でも表示される）
+  // 字幕はブラウザ標準の字幕トラックで表示する（全画面でも表示される）。
+  // トラック要素を作り直す方式は実機Chromeで切り替えが反映されないことがあったため、
+  // 1つのトラックを保持し、中身のキューを直接書き換える方式にする
+  function ensureSubTrack() {
+    if (subTrack) return subTrack;
+    // 言語は固定しない（原文が英語でも日本語と誤表示しないため、言語指定は空にする）
+    subTrack = video.addTextTrack('captions', '字幕', '');
+    subTrack.mode = 'showing';
+    return subTrack;
+  }
+
   function applyTrack() {
     const cuesToUse = currentCues();
     if (!cuesToUse) return;
-    if (trackUrl) URL.revokeObjectURL(trackUrl);
-    const vtt = 'WEBVTT\n\n' + cuesToUse.map(c =>
-      `${formatVTTTime(c.start)} --> ${formatVTTTime(c.end)}\n${c.text}`
-    ).join('\n\n') + '\n';
-    trackUrl = URL.createObjectURL(new Blob([vtt], { type: 'text/vtt' }));
-    trackEl = document.createElement('track');
-    trackEl.kind = 'captions';
-    trackEl.label = '字幕';
-    // 言語は固定しない（原文が英語でも日本語と誤表示しないため、srclangは付けない）
-    trackEl.src = trackUrl;
-    trackEl.default = true;
-    video.appendChild(trackEl);
-    trackEl.addEventListener('load', () => { trackEl.track.mode = 'showing'; nudgeSubtitleRepaint(); });
-    if (trackEl.track) trackEl.track.mode = 'showing';
-  }
-
-  // 停止中に字幕トラックを差し替えると、表示中の字幕が画面に残ったままになる
-  // （翻訳OFFが効いていないように見える）ため、同じ位置へシークし直して再描画を促す
-  function nudgeSubtitleRepaint() {
-    if (!video.paused) return;
-    if (video.readyState === 0 || !isFinite(video.duration)) return;
-    try { video.currentTime = video.currentTime; } catch {}
+    const track = ensureSubTrack();
+    if (track.mode === 'disabled') track.mode = 'hidden';
+    const existing = track.cues ? Array.from(track.cues) : [];
+    for (const c of existing) { try { track.removeCue(c); } catch {} }
+    for (const c of cuesToUse) {
+      try { track.addCue(new VTTCue(c.start, Math.max(c.end, c.start + 0.01), c.text)); } catch {}
+    }
+    track.mode = 'showing';
   }
 
   async function loadSRT(file) {
@@ -218,7 +205,6 @@
     const text = await readSRTText(file);
     savedCues = parseSRT(text);
     translatedCues = null;
-    if (trackEl) { trackEl.remove(); trackEl = null; }
     applyTrack();
     showToast(savedCues.length ? `字幕 ${savedCues.length} 件を読み込みました` : '字幕を読み取れませんでした');
     if (translateOn && savedCues.length) translateAll();
@@ -287,7 +273,6 @@
       }
       if (idx - lastApplied >= 50 || idx === myCues.length) {
         translatedCues = out.slice(0, idx);
-        if (trackEl) { trackEl.remove(); trackEl = null; }
         applyTrack();
         lastApplied = idx;
         if (idx < myCues.length) showToast(`翻訳中 ${idx} / ${myCues.length} 件`, true);
@@ -308,7 +293,6 @@
     if (translateOn) {
       translateOn = false;
       updateTranslateLabel();
-      if (trackEl) { trackEl.remove(); trackEl = null; }
       applyTrack();
       showToast('翻訳をオフにしました（原文字幕に戻ります）');
       return;
