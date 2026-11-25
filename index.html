@@ -89,7 +89,10 @@
   <button id="translateToggle" type="button">翻訳：OFF</button>
 </div>
 <div id="toast"></div>
-<input type="file" id="videoInput" accept=".mp4,.m4v,.webm,.mkv,.mov,.avi,.mpg,.mpeg,.3gp">
+<!-- acceptに動画以外の種類(.txt)を混ぜてあるのはAndroid対策: 動画だけの指定だと
+     Androidが「画像を選択」メディア画面(完了ボタン付き)を出し、空指定だとカメラ選択シートになる。
+     文書の種類が混ざると「字幕」と同じ文書ピッカーが直接開き、タップで即決定になる -->
+<input type="file" id="videoInput" accept=".mp4,.m4v,.webm,.mkv,.mov,.avi,.mpg,.mpeg,.3gp,.txt">
 <input type="file" id="srtInput" accept=".srt">
 
 
@@ -101,10 +104,6 @@
   const menu = document.getElementById('menu');
   const videoInput = document.getElementById('videoInput');
   const srtInput = document.getElementById('srtInput');
-  // AndroidのChromeでは、acceptが動画だけだと「写真と動画」の選択画面になり
-  // 「完了」を押すまでプレーヤーに戻れないため、Androidではacceptを外して
-  // 「字幕」と同じ通常のファイル選択画面にする（他のOSでは絞り込みを維持）
-  if (/Android/i.test(navigator.userAgent)) videoInput.removeAttribute('accept');
   // タブキャスト（画面ミラーリング）を維持するための設定：
   // 動画だけをテレビへ渡す「リモート再生」を無効化し、
   // 字幕や画面がそのままタブの映像として映るようにする
