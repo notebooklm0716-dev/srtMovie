@@ -101,11 +101,6 @@
   const menu = document.getElementById('menu');
   const videoInput = document.getElementById('videoInput');
   const srtInput = document.getElementById('srtInput');
-  // Android対策: 動画の種類を含む指定だと、AndroidのChromeは必ずメディア選択画面か
-  // カメラ選択シートを挟んでしまう。そこでAndroidでは動画選択にも字幕と全く同じ
-  // 指定(.srt)を使い、字幕と同じ文書ピッカーをそのまま開く（選んだファイルは
-  // 動画として読み込む。文書ピッカー側に絞り込みが無い前提の方法）
-  if (/Android/i.test(navigator.userAgent)) videoInput.accept = '.srt';
   // タブキャスト（画面ミラーリング）を維持するための設定：
   // 動画だけをテレビへ渡す「リモート再生」を無効化し、
   // 字幕や画面がそのままタブの映像として映るようにする
