@@ -101,6 +101,10 @@
   const menu = document.getElementById('menu');
   const videoInput = document.getElementById('videoInput');
   const srtInput = document.getElementById('srtInput');
+  // AndroidのChromeでは、acceptが動画だけだと「写真と動画」の選択画面になり
+  // 「完了」を押すまでプレーヤーに戻れないため、Androidではacceptを外して
+  // 「字幕」と同じ通常のファイル選択画面にする（他のOSでは絞り込みを維持）
+  if (/Android/i.test(navigator.userAgent)) videoInput.removeAttribute('accept');
   // タブキャスト（画面ミラーリング）を維持するための設定：
   // 動画だけをテレビへ渡す「リモート再生」を無効化し、
   // 字幕や画面がそのままタブの映像として映るようにする
