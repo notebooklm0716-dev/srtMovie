@@ -67,6 +67,29 @@
     white-space: nowrap;
   }
   input[type="file"] { display: none; }
+  /* 保存済み翻訳の一覧パネル */
+  #savedPanel {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%);
+    width: min(92vw, 480px); max-height: 76dvh;
+    background: rgba(20,20,20,.97);
+    border: 1px solid rgba(255,255,255,.25); border-radius: 10px;
+    display: none; z-index: 40;
+    font-family: sans-serif; color: #fff;
+    padding: 14px;
+  }
+  #savedPanel.open { display: flex; flex-direction: column; }
+  .savedHead { display: flex; justify-content: space-between; align-items: center; font-size: 16px; margin-bottom: 8px; }
+  #savedSummary { font-size: 13px; color: rgba(255,255,255,.75); margin-bottom: 4px; }
+  #savedItems { overflow-y: auto; }
+  .savedRow { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 0; border-top: 1px solid rgba(255,255,255,.12); }
+  .savedName { font-size: 14px; word-break: break-all; }
+  .savedMeta { font-size: 12px; color: rgba(255,255,255,.65); }
+  #savedPanel button {
+    background: rgba(255,255,255,.12); color: #fff;
+    border: 1px solid rgba(255,255,255,.25); border-radius: 6px;
+    padding: 6px 12px; font-size: 13px; cursor: pointer; white-space: nowrap;
+  }
+  .savedFoot { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
 </style>
     <!-- PWA設定 -->
     <link rel="manifest" href="./manifest.json">
@@ -87,6 +110,19 @@
   <button id="videoSelect" type="button">動画</button>
   <button id="srtSelect" type="button">字幕</button>
   <button id="translateToggle" type="button">翻訳：OFF</button>
+  <button id="saveTransBtn" type="button">翻訳字幕を保存</button>
+  <button id="folderBtn" type="button">字幕フォルダ</button>
+  <button id="savedListBtn" type="button">保存済み翻訳</button>
+</div>
+<div id="savedPanel">
+  <div class="savedHead"><span>保存済み翻訳</span><button id="savedClose" type="button">閉じる</button></div>
+  <div id="savedSummary"></div>
+  <div id="savedItems"></div>
+  <div class="savedFoot">
+    <button id="deleteOldestBtn" type="button">最も古いものを削除</button>
+    <button id="deleteAllBtn" type="button">すべて削除</button>
+    <button id="reselectFolderBtn" type="button">フォルダを選び直す</button>
+  </div>
 </div>
 <div id="toast"></div>
 <input type="file" id="videoInput" accept=".mp4,.m4v,.webm,.mkv,.mov,.avi,.mpg,.mpeg,.3gp">
@@ -167,10 +203,16 @@
   let translateOn = false;
   let translator = null;
   let translating = false;
+  // 翻訳の保存（A+C方式）で使う状態
+  let savedSrtName = '';       // 読み込んだ元字幕のファイル名
+  let savedSrtKey = '';        // アプリ内保存（IndexedDB）のキー＝字幕の指紋
+  let restoredShown = false;   // 保存済み翻訳を復元して表示中かどうか
+  let pendingCompanion = null; // 元字幕より先に渡された翻訳済みファイル {base, entries}
+  let dirHandle = null;        // 字幕フォルダのハンドル（A方式）
 
   function currentCues() {
     if (!savedCues) return null;
-    if (translateOn && translatedCues) {
+    if ((translateOn || restoredShown) && translatedCues) {
       // 翻訳できた分は日本語、まだの分は原文で表示する（部分適用）
       return savedCues.map((c, i) => translatedCues[i] || c);
     }
@@ -201,13 +243,195 @@
     track.mode = 'showing';
   }
 
+  // ===== 翻訳の保存（A+C方式） =====
+  // C: 翻訳結果をアプリ内（IndexedDB）に自動保存し、同じ字幕を次回選んだら自動で復元する
+  // A: 許可されたフォルダ内の「元名__Translator__.srt」を自動で探して読み込む。
+  //    実ファイルへの書き出しは「翻訳字幕を保存」を押したときだけ行う
+
+  function baseNameOf(name) { return (name || '').replace(/\.[^.]+$/, ''); }
+  function companionName(name) { return baseNameOf(name) + '__Translator__.srt'; }
+  function cueKey(c) { return c.start.toFixed(3) + '|' + c.end.toFixed(3); }
+
+  function secondsToSrtTime(sec) {
+    const ms = Math.max(0, Math.round(sec * 1000));
+    const p = (n, l = 2) => String(n).padStart(l, '0');
+    return `${p(Math.floor(ms / 3600000))}:${p(Math.floor(ms % 3600000 / 60000))}:${p(Math.floor(ms % 60000 / 1000))},${p(ms % 1000, 3)}`;
+  }
+
+  // 字幕の指紋（ファイル名＋本文のハッシュ）。同じ字幕かどうかはこれで判定する
+  async function srtFingerprint(name, text) {
+    try {
+      const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+      const hash = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
+      return name + '::' + hash;
+    } catch {
+      let h = 0;
+      for (let i = 0; i < text.length; i++) h = (h * 31 + text.charCodeAt(i)) | 0;
+      return name + '::x' + (h >>> 0).toString(16);
+    }
+  }
+
+  // IndexedDB（translations: 翻訳データ / handles: フォルダのハンドル）
+  function idbOpen() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open('srtmovie-store', 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains('translations')) db.createObjectStore('translations', { keyPath: 'key' });
+        if (!db.objectStoreNames.contains('handles')) db.createObjectStore('handles');
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  function idbReq(storeName, mode, makeReq) {
+    return idbOpen().then(db => new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, mode);
+      const req = makeReq(tx.objectStore(storeName));
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+      tx.oncomplete = () => db.close();
+    }));
+  }
+  const idbGet = (s, k) => idbReq(s, 'readonly', st => st.get(k)).catch(() => undefined);
+  const idbPut = (s, v, k) => idbReq(s, 'readwrite', st => (k === undefined ? st.put(v) : st.put(v, k))).catch(() => {});
+  const idbAll = (s) => idbReq(s, 'readonly', st => st.getAll()).catch(() => []);
+  const idbDelete = (s, k) => idbReq(s, 'readwrite', st => st.delete(k)).catch(() => {});
+
+  // 翻訳済みの字幕だけを entries 形式（{s, e, t}）で取り出す。
+  // 保存ファイル・DBのどちらにも「訳せた字幕だけ」を入れるので、
+  // 読み込んだときに「ある＝翻訳済み」と判定できる
+  function collectTranslatedEntries(cues, outArr) {
+    const entries = [];
+    if (!cues || !outArr) return entries;
+    cues.forEach((c, i) => {
+      const t = outArr[i];
+      if (t) entries.push({ s: +c.start.toFixed(3), e: +c.end.toFixed(3), t: t.text });
+    });
+    return entries;
+  }
+
+  // C: アプリ内へ自動保存する
+  async function persistTranslationsFor(key, fileName, cues, outArr) {
+    if (!key || !cues || !outArr) return;
+    const entries = collectTranslatedEntries(cues, outArr);
+    if (!entries.length) return;
+    const rec = {
+      key, baseName: baseNameOf(fileName), fileName,
+      updatedAt: Date.now(), count: entries.length,
+      bytes: new Blob([JSON.stringify(entries)]).size, entries
+    };
+    await idbPut('translations', rec);
+  }
+  function persistTranslations() {
+    return persistTranslationsFor(savedSrtKey, savedSrtName, savedCues, translatedCues);
+  }
+
+  // 翻訳済みデータ（時刻つき字幕の配列）を、今の字幕へ時刻で照合して合体させる。
+  // 合体できた件数を返す。同じ箇所は新しいデータで上書きする
+  function applyTranslationEntries(entries) {
+    if (!savedCues || !entries || !entries.length) return 0;
+    if (!translatedCues) translatedCues = new Array(savedCues.length);
+    const byKey = new Map(savedCues.map((c, i) => [cueKey(c), i]));
+    let n = 0;
+    for (const e of entries) {
+      const i = byKey.get(e.start.toFixed(3) + '|' + e.end.toFixed(3));
+      if (i !== undefined) {
+        translatedCues[i] = { start: savedCues[i].start, end: savedCues[i].end, text: e.text };
+        n++;
+      }
+    }
+    return n;
+  }
+
+  // A: フォルダの許可状態を確認する（request=true のときは許可を求める）
+  async function ensureDirPermission(handle, write, request) {
+    const opts = { mode: write ? 'readwrite' : 'read' };
+    try {
+      if ((await handle.queryPermission(opts)) === 'granted') return true;
+      if (!request) return false;
+      return (await handle.requestPermission(opts)) === 'granted';
+    } catch { return false; }
+  }
+  async function loadDirHandle() {
+    if (dirHandle) return dirHandle;
+    dirHandle = (await idbGet('handles', 'srtDir')) || null;
+    return dirHandle;
+  }
+  // A: フォルダ内の翻訳済みファイルを探して合体させる（許可済みの場合のみ、静かに行う）
+  async function tryLoadFolderCompanion() {
+    if (!('showDirectoryPicker' in window) || !savedSrtName) return 0;
+    try {
+      const handle = await loadDirHandle();
+      if (!handle) return 0;
+      if (!(await ensureDirPermission(handle, false, false))) return 0;
+      const fh = await handle.getFileHandle(companionName(savedSrtName));
+      const f = await fh.getFile();
+      return applyTranslationEntries(parseSRT(await readSRTText(f)));
+    } catch { return 0; }
+  }
+
+  // __Translator__ ファイルが単独で渡されたときの取り込み
+  async function importCompanionFile(file) {
+    const base = baseNameOf(file.name.replace(/__Translator__\.srt$/i, '.srt'));
+    const entries = parseSRT(await readSRTText(file));
+    if (savedCues && baseNameOf(savedSrtName) === base) {
+      const n = applyTranslationEntries(entries);
+      if (n > 0) {
+        restoredShown = true;
+        updateTranslateLabel();
+        applyTrack();
+        persistTranslations();
+        showToast(`翻訳済みファイルから ${n} 件を取り込みました`);
+      } else {
+        showToast('今の字幕と時刻が合う翻訳がありませんでした');
+      }
+    } else {
+      pendingCompanion = { base, entries };
+      showToast('翻訳済みファイルを控えました。元の字幕を選ぶと合体します');
+    }
+  }
+
+  // 翻訳済みの字幕だけからSRTファイルの中身を作る
+  function buildTranslatedSrt() {
+    const items = [];
+    if (savedCues && translatedCues) {
+      savedCues.forEach((c, i) => { if (translatedCues[i]) items.push(translatedCues[i]); });
+    }
+    items.sort((a, b) => a.start - b.start);
+    return items.map((c, i) => `${i + 1}\n${secondsToSrtTime(c.start)} --> ${secondsToSrtTime(c.end)}\n${c.text}\n`).join('\n');
+  }
+
   async function loadSRT(file) {
     if (!file) return;
+    // 翻訳済みファイルが選ばれた場合は、字幕そのものではなく翻訳データとして取り込む
+    if (/__Translator__\.srt$/i.test(file.name)) { await importCompanionFile(file); return; }
     const text = await readSRTText(file);
     savedCues = parseSRT(text);
     translatedCues = null;
+    restoredShown = false;
+    savedSrtName = file.name;
+    savedSrtKey = await srtFingerprint(file.name, text);
     applyTrack();
     showToast(savedCues.length ? `字幕 ${savedCues.length} 件を読み込みました` : '字幕を読み取れませんでした');
+    // 保存済み翻訳の復元（C：アプリ内 → A：フォルダ → 先渡しの翻訳ファイル の順に合体）
+    let restored = 0;
+    try {
+      const rec = await idbGet('translations', savedSrtKey);
+      if (rec && rec.entries) restored += applyTranslationEntries(rec.entries.map(e => ({ start: e.s, end: e.e, text: e.t })));
+    } catch {}
+    restored += await tryLoadFolderCompanion();
+    if (pendingCompanion && pendingCompanion.base === baseNameOf(file.name)) {
+      restored += applyTranslationEntries(pendingCompanion.entries);
+      pendingCompanion = null;
+    }
+    if (restored > 0) {
+      restoredShown = true;
+      updateTranslateLabel();
+      applyTrack();
+      persistTranslations(); // 合体した内容でアプリ内保存も最新化する
+      showToast(`保存済みの翻訳 ${restored} 件を読み込みました`);
+    }
     if (translateOn && savedCues.length) translateAll();
   }
 
@@ -251,13 +475,18 @@
 
   // ChromeのTranslator API（端末内翻訳）で英語字幕を日本語にする。
   // 文単位で翻訳し、全件終わるまで待たず、50件ごとに翻訳できた分から表示へ反映する。
-  // 訳す順番は再生位置から先にし、見ている場面がすぐ日本語になるようにする
+  // 訳す順番は再生位置から先にし、見ている場面がすぐ日本語になるようにする。
+  // 復元済みの文は翻訳を飛ばす（追加式）。訳せなかった文は「未翻訳」のまま残し、
+  // 保存対象にもしない。進むたびにアプリ内（IndexedDB）へ自動保存する
   async function translateAll() {
     if (translating || !translator || !savedCues) return;
     translating = true;
     const myCues = savedCues; // 途中で別の字幕に差し替わったら、この翻訳は打ち切る
+    const myKey = savedSrtKey;
+    const myName = savedSrtName;
     const indexOf = new Map(myCues.map((c, i) => [c, i]));
-    const out = new Array(myCues.length);
+    // 復元済みの翻訳を引き継ぐ
+    const out = translatedCues ? translatedCues.slice() : new Array(myCues.length);
     let done = 0;
     let lastApplied = 0;
     const groups = groupCuesIntoSentences(myCues);
@@ -266,7 +495,12 @@
     if (startAt < 0) startAt = 0;
     const ordered = groups.slice(startAt).concat(groups.slice(0, startAt));
     for (const group of ordered) {
-      if (!translateOn || savedCues !== myCues) { translating = false; return; }
+      if (!translateOn || savedCues !== myCues) {
+        persistTranslationsFor(myKey, myName, myCues, out); // ここまでの分は保存しておく
+        translating = false;
+        return;
+      }
+      if (group.every(c => out[indexOf.get(c)])) { done += group.length; continue; } // 翻訳済みの文は飛ばす
       const joined = group.map(c => c.text.replace(/\n/g, ' ')).join(' ');
       let parts = null;
       try {
@@ -276,36 +510,43 @@
           new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 20000))
         ]), group);
       } catch {
-        parts = null; // 訳せなかった文は原文のままにする
+        parts = null; // 訳せなかった文は未翻訳のままにする（表示は原文、保存はしない）
       }
       for (let j = 0; j < group.length; j++) {
         const c = group[j];
-        out[indexOf.get(c)] = parts && parts[j] ? { start: c.start, end: c.end, text: parts[j] } : c;
+        if (parts && parts[j]) out[indexOf.get(c)] = { start: c.start, end: c.end, text: parts[j] };
         done++;
       }
       if (done - lastApplied >= 50 || done === myCues.length) {
         translatedCues = out.slice();
         applyTrack();
+        persistTranslationsFor(myKey, myName, myCues, out);
         lastApplied = done;
         if (done < myCues.length) showToast(`翻訳中 ${done} / ${myCues.length} 件`, true);
       }
     }
+    // スキップした文が多いと最後の反映タイミングを過ぎていることがあるため、最後に必ず反映する
+    translatedCues = out.slice();
+    applyTrack();
     translating = false;
+    persistTranslationsFor(myKey, myName, myCues, out);
     showToast('字幕の翻訳が完了しました');
   }
 
   const translateToggle = document.getElementById('translateToggle');
   function updateTranslateLabel() {
-    translateToggle.textContent = translateOn ? '翻訳：ON' : '翻訳：OFF';
+    translateToggle.textContent = (translateOn || restoredShown) ? '翻訳：ON' : '翻訳：OFF';
   }
 
   translateToggle.addEventListener('click', async (e) => {
     e.stopPropagation();
     menu.classList.remove('open');
-    if (translateOn) {
+    if (translateOn || restoredShown) {
       translateOn = false;
+      restoredShown = false;
       updateTranslateLabel();
       applyTrack();
+      persistTranslations(); // ここまでの翻訳はアプリ内に残しておく
       showToast('翻訳をオフにしました（原文字幕に戻ります）');
       return;
     }
@@ -368,7 +609,7 @@
 
   let lastTapTime = 0;
   document.addEventListener('click', (e) => {
-    if (e.target.closest && (e.target.closest('#menuBtn') || e.target.closest('#menu'))) return;
+    if (e.target.closest && (e.target.closest('#menuBtn') || e.target.closest('#menu') || e.target.closest('#savedPanel'))) return;
     const wasOpen = menu.classList.contains('open');
     menu.classList.remove('open');
     if (wasOpen) { lastTapTime = 0; return; } // メニューを閉じたタップは数えない
@@ -398,6 +639,148 @@
     e.stopPropagation();
     menu.classList.remove('open');
     srtInput.click();
+  });
+
+  // 「翻訳字幕を保存」：実ファイルへの書き出しは、このボタンを押したときだけ行う。
+  // フォルダの許可があればそのフォルダへ直接上書き保存し、無ければダウンロードする
+  document.getElementById('saveTransBtn').addEventListener('click', async (e) => {
+    e.stopPropagation();
+    menu.classList.remove('open');
+    if (!savedCues || !translatedCues || !translatedCues.some(Boolean)) {
+      showToast('保存できる翻訳がまだありません');
+      return;
+    }
+    const name = companionName(savedSrtName);
+    const text = buildTranslatedSrt();
+    try {
+      if ('showDirectoryPicker' in window) {
+        const handle = await loadDirHandle();
+        if (handle && (await ensureDirPermission(handle, true, true))) {
+          const fh = await handle.getFileHandle(name, { create: true });
+          const w = await fh.createWritable();
+          await w.write(text);
+          await w.close();
+          showToast(`フォルダに ${name} を保存しました`);
+          return;
+        }
+      }
+    } catch { /* フォルダ保存に失敗したらダウンロードへ回す */ }
+    const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    showToast(`${name} をダウンロードしました`);
+  });
+
+  // 「字幕フォルダ」：フォルダを選んで許可をもらい、その後は翻訳ファイルの
+  // 自動探索（読み込み）に使う。対応していない端末では項目自体を隠す
+  const folderBtn = document.getElementById('folderBtn');
+  const reselectFolderBtn = document.getElementById('reselectFolderBtn');
+  if (!('showDirectoryPicker' in window)) {
+    folderBtn.style.display = 'none';
+    reselectFolderBtn.style.display = 'none';
+  }
+  folderBtn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    menu.classList.remove('open');
+    if (!('showDirectoryPicker' in window)) {
+      showToast('この端末ではフォルダ連携が使えません');
+      return;
+    }
+    try {
+      let handle = await loadDirHandle();
+      if (!handle) {
+        handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+        dirHandle = handle;
+        await idbPut('handles', handle, 'srtDir');
+      } else if (!(await ensureDirPermission(handle, true, true))) {
+        showToast('フォルダの許可が得られませんでした');
+        return;
+      }
+      showToast(`字幕フォルダ：${handle.name}`);
+      if (savedCues) {
+        const n = await tryLoadFolderCompanion();
+        if (n > 0) {
+          restoredShown = true;
+          updateTranslateLabel();
+          applyTrack();
+          persistTranslations();
+          showToast(`フォルダの翻訳ファイルから ${n} 件を読み込みました`);
+        }
+      }
+    } catch { /* フォルダ選択をキャンセルした場合は何もしない */ }
+  });
+  reselectFolderBtn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    dirHandle = null;
+    await idbDelete('handles', 'srtDir');
+    document.getElementById('savedPanel').classList.remove('open');
+    folderBtn.click();
+  });
+
+  // 「保存済み翻訳」パネル（アプリ内保存の一覧・容量・削除）
+  const savedPanel = document.getElementById('savedPanel');
+  const savedSummary = document.getElementById('savedSummary');
+  const savedItems = document.getElementById('savedItems');
+  function fmtBytes(b) { return b >= 1024 ? (b / 1024).toFixed(1) + ' KB' : (b || 0) + ' B'; }
+  function fmtDate(ts) {
+    const d = new Date(ts);
+    return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  }
+  async function renderSavedPanel() {
+    const recs = (await idbAll('translations')).sort((a, b) => b.updatedAt - a.updatedAt);
+    const total = recs.reduce((a, r) => a + (r.bytes || 0), 0);
+    savedSummary.textContent = recs.length ? `${recs.length} 本の字幕 / 合計 ${fmtBytes(total)}` : '保存済みの翻訳はまだありません';
+    savedItems.innerHTML = '';
+    for (const r of recs) {
+      const row = document.createElement('div');
+      row.className = 'savedRow';
+      const info = document.createElement('div');
+      const nameEl = document.createElement('div');
+      nameEl.className = 'savedName';
+      nameEl.textContent = r.fileName || r.baseName || '';
+      const metaEl = document.createElement('div');
+      metaEl.className = 'savedMeta';
+      metaEl.textContent = `翻訳 ${r.count} 件 ・ ${fmtBytes(r.bytes || 0)} ・ ${fmtDate(r.updatedAt)}`;
+      info.append(nameEl, metaEl);
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.textContent = '削除';
+      del.addEventListener('click', async () => {
+        await idbDelete('translations', r.key);
+        renderSavedPanel();
+        showToast('削除しました');
+      });
+      row.append(info, del);
+      savedItems.append(row);
+    }
+  }
+  document.getElementById('savedListBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    menu.classList.remove('open');
+    renderSavedPanel();
+    savedPanel.classList.add('open');
+  });
+  document.getElementById('savedClose').addEventListener('click', (e) => {
+    e.stopPropagation();
+    savedPanel.classList.remove('open');
+  });
+  document.getElementById('deleteOldestBtn').addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const recs = (await idbAll('translations')).sort((a, b) => a.updatedAt - b.updatedAt);
+    if (!recs.length) { showToast('保存済みの翻訳がありません'); return; }
+    await idbDelete('translations', recs[0].key);
+    renderSavedPanel();
+    showToast(`最も古い「${recs[0].fileName || ''}」を削除しました`);
+  });
+  document.getElementById('deleteAllBtn').addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const recs = await idbAll('translations');
+    for (const r of recs) await idbDelete('translations', r.key);
+    renderSavedPanel();
+    showToast('保存済みの翻訳をすべて削除しました');
   });
 
   videoInput.addEventListener('change', () => {
