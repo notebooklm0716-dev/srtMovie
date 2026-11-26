@@ -576,12 +576,10 @@
   translateToggle.addEventListener('click', async (e) => {
     e.stopPropagation();
     menu.classList.remove('open');
-    // 復元表示中でも、まだ未翻訳が残っている場合は「OFF」ではなく続きの翻訳を始める
-    // （表示がONに見えるのに押すと消えてしまう、という混乱を避けるため）。
-    // 全部翻訳済みの場合だけ、復元表示中の一押しでOFFにする
-    const allTranslated = !!(savedCues && savedCues.length && translatedCues
-      && translatedCues.filter(Boolean).length >= savedCues.length);
-    if (translateOn || (restoredShown && allTranslated)) {
+    // OFFにするのは「翻訳：ON」のときだけ。「表示中」のときに押したら、
+    // 残りがあれば続きの翻訳、全部済んでいればそのままONにする
+    // （表示中→ON→OFFと、押すたびに次の状態へ進む素直な巡回にするため）
+    if (translateOn) {
       translateOn = false;
       restoredShown = false;
       updateTranslateLabel();
