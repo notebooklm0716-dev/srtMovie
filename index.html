@@ -273,24 +273,44 @@
 
   // IndexedDB（translations: 翻訳データ / handles: フォルダのハンドル）
   function idbOpen() {
-    return new Promise((resolve, reject) => {
-      const req = indexedDB.open('srtmovie-store', 1);
+    // 万一、ストアの無いDBだけが先に作られていた場合は、版を上げて作り直す（自己修復）
+    const openAt = (version) => new Promise((resolve, reject) => {
+      const req = indexedDB.open('srtmovie-store', version);
       req.onupgradeneeded = () => {
         const db = req.result;
         if (!db.objectStoreNames.contains('translations')) db.createObjectStore('translations', { keyPath: 'key' });
         if (!db.objectStoreNames.contains('handles')) db.createObjectStore('handles');
       };
-      req.onsuccess = () => resolve(req.result);
+      req.onsuccess = () => {
+        const db = req.result;
+        if (db.objectStoreNames.contains('translations') && db.objectStoreNames.contains('handles')) {
+          resolve(db);
+        } else {
+          const v = db.version + 1;
+          db.close();
+          openAt(v).then(resolve, reject);
+        }
+      };
       req.onerror = () => reject(req.error);
+      req.onblocked = () => reject(new Error('indexedDB blocked'));
     });
+    return openAt(1);
   }
   function idbReq(storeName, mode, makeReq) {
     return idbOpen().then(db => new Promise((resolve, reject) => {
-      const tx = db.transaction(storeName, mode);
-      const req = makeReq(tx.objectStore(storeName));
+      let req;
+      try {
+        const tx = db.transaction(storeName, mode);
+        req = makeReq(tx.objectStore(storeName));
+        tx.oncomplete = () => db.close();
+        tx.onabort = () => db.close();
+      } catch (e) {
+        db.close();
+        reject(e);
+        return;
+      }
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
-      tx.oncomplete = () => db.close();
     }));
   }
   const idbGet = (s, k) => idbReq(s, 'readonly', st => st.get(k)).catch(() => undefined);
@@ -430,7 +450,9 @@
       updateTranslateLabel();
       applyTrack();
       persistTranslations(); // 合体した内容でアプリ内保存も最新化する
-      showToast(`保存済みの翻訳 ${restored} 件を読み込みました`);
+      showToast(restored < savedCues.length
+        ? `保存済みの翻訳 ${restored} 件を読み込みました（残り ${savedCues.length - restored} 件）`
+        : `保存済みの翻訳 ${restored} 件を読み込みました`);
     }
     if (translateOn && savedCues.length) translateAll();
   }
@@ -494,13 +516,30 @@
     let startAt = groups.findIndex(g => g[g.length - 1].end > now);
     if (startAt < 0) startAt = 0;
     const ordered = groups.slice(startAt).concat(groups.slice(0, startAt));
+    // 進捗の表示と反映。翻訳済みの文を飛ばしている間も、50件ごとに上部へ出す。
+    // 件数は「今回処理した数」ではなく「翻訳済みの総数」で出す
+    // （途中から再開しても、前回分を含めた数が見えるようにするため）
+    let madeNew = false;
+    const translatedTotal = () => out.filter(Boolean).length;
+    const report = (force) => {
+      if (!force && done - lastApplied < 50) return;
+      translatedCues = out.slice();
+      applyTrack();
+      persistTranslationsFor(myKey, myName, myCues, out);
+      lastApplied = done;
+      if (done < myCues.length) showToast(`翻訳中 ${translatedTotal()} / ${myCues.length} 件`, true);
+    };
+    const alreadyDone = out.filter(Boolean).length;
+    showToast(alreadyDone > 0
+      ? `翻訳を再開します（${alreadyDone} / ${myCues.length} 件は翻訳済み）`
+      : `翻訳中 0 / ${myCues.length} 件`, true);
     for (const group of ordered) {
       if (!translateOn || savedCues !== myCues) {
         persistTranslationsFor(myKey, myName, myCues, out); // ここまでの分は保存しておく
         translating = false;
         return;
       }
-      if (group.every(c => out[indexOf.get(c)])) { done += group.length; continue; } // 翻訳済みの文は飛ばす
+      if (group.every(c => out[indexOf.get(c)])) { done += group.length; report(false); continue; } // 翻訳済みの文は飛ばす
       const joined = group.map(c => c.text.replace(/\n/g, ' ')).join(' ');
       let parts = null;
       try {
@@ -514,34 +553,35 @@
       }
       for (let j = 0; j < group.length; j++) {
         const c = group[j];
-        if (parts && parts[j]) out[indexOf.get(c)] = { start: c.start, end: c.end, text: parts[j] };
+        if (parts && parts[j]) { out[indexOf.get(c)] = { start: c.start, end: c.end, text: parts[j] }; madeNew = true; }
         done++;
       }
-      if (done - lastApplied >= 50 || done === myCues.length) {
-        translatedCues = out.slice();
-        applyTrack();
-        persistTranslationsFor(myKey, myName, myCues, out);
-        lastApplied = done;
-        if (done < myCues.length) showToast(`翻訳中 ${done} / ${myCues.length} 件`, true);
-      }
+      report(false);
     }
     // スキップした文が多いと最後の反映タイミングを過ぎていることがあるため、最後に必ず反映する
     translatedCues = out.slice();
     applyTrack();
     translating = false;
     persistTranslationsFor(myKey, myName, myCues, out);
-    showToast('字幕の翻訳が完了しました');
+    showToast(madeNew ? '字幕の翻訳が完了しました' : 'すべて翻訳済みです（新しい翻訳はありませんでした）');
   }
 
   const translateToggle = document.getElementById('translateToggle');
   function updateTranslateLabel() {
-    translateToggle.textContent = (translateOn || restoredShown) ? '翻訳：ON' : '翻訳：OFF';
+    // ONは「翻訳を実行できる状態」のときだけ。保存済み翻訳を表示しているだけの
+    // 状態は「表示中」と分ける（ONと紛らわしくしないため）
+    translateToggle.textContent = translateOn ? '翻訳：ON' : (restoredShown ? '翻訳：表示中' : '翻訳：OFF');
   }
 
   translateToggle.addEventListener('click', async (e) => {
     e.stopPropagation();
     menu.classList.remove('open');
-    if (translateOn || restoredShown) {
+    // 復元表示中でも、まだ未翻訳が残っている場合は「OFF」ではなく続きの翻訳を始める
+    // （表示がONに見えるのに押すと消えてしまう、という混乱を避けるため）。
+    // 全部翻訳済みの場合だけ、復元表示中の一押しでOFFにする
+    const allTranslated = !!(savedCues && savedCues.length && translatedCues
+      && translatedCues.filter(Boolean).length >= savedCues.length);
+    if (translateOn || (restoredShown && allTranslated)) {
       translateOn = false;
       restoredShown = false;
       updateTranslateLabel();
