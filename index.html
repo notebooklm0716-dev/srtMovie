@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -19,14 +19,15 @@
     background: rgba(0,0,0,.8);
     font-family: sans-serif;
   }
-  #hint {
-    position: fixed; inset: 0;
-    display: flex; align-items: center; justify-content: center;
-    color: rgba(255,255,255,.75);
-    font-family: sans-serif; font-size: 18px;
-    pointer-events: none;
+  /* DOM字幕モードの字幕表示（ページ内の普通の文字として描く。Google翻訳から見えるようにするため） */
+  #cueOverlay {
+    position: fixed; left: 50%; bottom: 76px; transform: translateX(-50%);
+    max-width: 92vw; padding: 4px 12px; border-radius: 4px;
+    background: rgba(0,0,0,.8); color: #fff;
+    font-family: sans-serif; font-size: clamp(15px, 3vw, 26px); line-height: 1.45;
+    text-align: center; white-space: pre-line;
+    pointer-events: none; display: none; z-index: 15;
   }
-  #hint.hidden { display: none; }
   /* 左上の「選択」ボタン（背景は透過。明るい映像でも読めるよう文字に影だけ付ける） */
   #menuBtn {
     position: fixed; left: 10px; top: 10px;
@@ -103,8 +104,8 @@
     <meta name="apple-mobile-web-app-title" content="動プレ">
 </head>
 <body>
+<div id="cueOverlay"></div>
 <video id="video" controls playsinline disableremoteplayback></video>
-<div id="hint">左上の「選択」から動画を選ぶ</div>
 <button id="menuBtn" type="button">選択</button>
 <div id="menu">
   <button id="videoSelect" type="button">動画</button>
@@ -131,7 +132,6 @@
 
 <script>
   const video = document.getElementById('video');
-  const hint = document.getElementById('hint');
   const toast = document.getElementById('toast');
   const menuBtn = document.getElementById('menuBtn');
   const menu = document.getElementById('menu');
@@ -159,7 +159,6 @@
     video.src = videoUrl;
     // 字幕トラックは動画を変えても保持されるので、読み込み済みの字幕を再適用する
     applyTrack();
-    hint.classList.add('hidden');
     video.play().catch(() => {});
   }
 
@@ -240,7 +239,8 @@
     for (const c of cuesToUse) {
       try { track.addCue(new VTTCue(c.start, Math.max(c.end, c.start + 0.01), c.text)); } catch {}
     }
-    track.mode = 'showing';
+    track.mode = domMode ? 'hidden' : 'showing';
+    updateDomCue();
   }
 
   // ===== 翻訳の保存（A+C方式） =====
@@ -566,6 +566,62 @@
     showToast(madeNew ? '字幕の翻訳が完了しました' : 'すべて翻訳済みです（新しい翻訳はありませんでした）');
   }
 
+  // ===== DOM字幕モード =====
+  // 字幕をブラウザ標準の字幕トラックではなく、ページ内の普通の文字（DOM）として
+  // 映像の上に重ねて描くモード。Google翻訳から字幕が見えるようになる。
+  // 表示方式は独立した切替を持たず、翻訳のON/OFFに連動する：
+  // 翻訳OFFのときはDOM表示に固定（Google翻訳に任せる）、
+  // 翻訳ONのときは標準表示に固定（アプリの翻訳は字幕トラックで出す）。
+  // 同じ字幕が出ている間はDOMを書き換えない（Google翻訳が置いた訳文を壊さないため）。
+  const cueOverlay = document.getElementById('cueOverlay');
+  let domMode = true; // 起動時は翻訳OFFなのでDOM表示
+  let lastDomKey = '__init__';
+
+  function domCueIndexAt(cues, t) {
+    let lo = 0, hi = cues.length - 1, cand = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (cues[mid].start <= t) { cand = mid; lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return (cand >= 0 && t <= cues[cand].end) ? cand : -1;
+  }
+
+  function updateDomCue() {
+    if (!domMode) {
+      if (cueOverlay.style.display !== 'none') cueOverlay.style.display = 'none';
+      lastDomKey = '__init__';
+      return;
+    }
+    const cues = currentCues();
+    if (!cues || !cues.length) {
+      if (lastDomKey !== 'none') { lastDomKey = 'none'; cueOverlay.textContent = ''; cueOverlay.style.display = 'none'; }
+      return;
+    }
+    const idx = domCueIndexAt(cues, video.currentTime || 0);
+    const key = idx < 0 ? 'none' : idx + '|' + cues[idx].text;
+    if (key === lastDomKey) return; // 同じ字幕の間は触らない
+    lastDomKey = key;
+    if (idx < 0) {
+      cueOverlay.textContent = '';
+      cueOverlay.style.display = 'none';
+    } else {
+      cueOverlay.textContent = cues[idx].text;
+      cueOverlay.style.display = 'block';
+    }
+  }
+
+  // 翻訳のON/OFFから表示方式を決め直す。翻訳状態が変わるたびに呼ばれる
+  function syncSubMode() {
+    domMode = !translateOn;
+    if (subTrack) subTrack.mode = domMode ? 'hidden' : 'showing';
+    lastDomKey = '__init__';
+    updateDomCue();
+  }
+
+  video.addEventListener('timeupdate', updateDomCue);
+  video.addEventListener('seeked', updateDomCue);
+  setInterval(() => { if (domMode && !video.paused && !video.ended) updateDomCue(); }, 100);
+
   const translateToggle = document.getElementById('translateToggle');
   function updateTranslateLabel() {
     // ONは「翻訳を実行できる状態」のときだけ。保存済み翻訳を表示しているだけの
@@ -582,6 +638,7 @@
     if (translateOn) {
       translateOn = false;
       restoredShown = false;
+      syncSubMode();
       updateTranslateLabel();
       applyTrack();
       persistTranslations(); // ここまでの翻訳はアプリ内に残しておく
@@ -624,6 +681,7 @@
       return;
     }
     translateOn = true;
+    syncSubMode();
     updateTranslateLabel();
     if (savedCues && savedCues.length) {
       translateAll();
@@ -844,6 +902,8 @@
       }
     });
   }
+
+  syncSubMode();
 
   // ドラッグ＆ドロップ（拡張子で動画／SRTを振り分け）
   document.addEventListener('dragover', e => e.preventDefault());
